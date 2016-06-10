@@ -54,10 +54,29 @@ Class OctopusVariableSet {
     
     [string] get([string]$name) { return $this.get($name, @{}) }
     [string] get([string]$name, [hashtable]$scope) {
+        $var = $this.get_with_properties($name, $scope)
+        If ($var) {return $var.Value}
+        return $null
+    }
+
+    [object] get_with_properties([string]$name) { return $this.get_with_properties($name, @{}) }
+    [object] get_with_properties([string]$name, [hashtable]$scope) {
         $this.update()
         $s = $this.convert_scope($scope)
         $var = $this.Content.Variables | Where {$_.Name -eq $name} | Where {$this.compare_scope($s, $_.Scope)}
-        If ($var) {return $var.Value}
+        If ($var) {
+            $sc = @{}
+            $var.Scope.PSObject.Properties | foreach {$sc[$_.Name]=[array]$_.Value}
+            return New-Object psobject -Property @{
+                Id = $var.Id
+                Name = $var.Name
+                Value = $var.Value
+                Scope = $sc
+                IsSensitive = $var.IsSensitive
+                IsEditable = $var.IsEditable
+                Prompt = $var.Prompt
+            }
+        }
         return $null
     }
     
@@ -157,10 +176,31 @@ Class OctopusVariableSet {
     
     [void]each([scriptblock]$action){
         $this.Content.Variables | foreach {
-            Invoke-Command -ScriptBlock $action -ArgumentList @( (New-Object psobject -Property $_) )
+            Invoke-Command -ScriptBlock $action -ArgumentList @( $_ )
         }
     }
     
+    [bool]contains([string]$name){ return $this.contains($name, @{})}
+    [bool]contains([string]$name, [hashtable]$scope) {
+        $vars = $this.Content.Variables | Where { $_.Name -Like $name -and $this.compare_scope($_.Scope, $this.convert_scope($scope))}
+        If ($vars) {return $true}
+        return $false
+    }
+
+    [bool]contains_value([string]$value){
+        $vars = $this.Content.Variables | Where { $_.value -eq $value -or $_.Value -Like $value -or $_.Value -Match $value }
+        If ($vars) {return $true}
+        return $false
+    }
+
+    [void]rename_variable([string]$name, [string]$new_name){
+        $this.Content.Variables | Where {$_.Name -eq $name} | ForEach-Object {$_.Name = $new_name}
+        $this.apply()
+    }
+    [void]replace_variable([string]$name, [string]$new_name){
+        $this.Content.Variables | Where {$_.Value -Match [regex]::escape("#{$name}")} | ForEach-Object { $_.Value = $_.Value -replace [regex]::escape("#{$name}"),"#{$new_name}"}
+        $this.apply()
+    }
 }
 
 function New-OctopusVariableSet {
@@ -190,7 +230,7 @@ function New-OctopusVariableSet {
         'ByName' {
             $res = (Get-OctopusResource 'libraryvariablesets/all' -Server $Server -ApiKey $ApiKey) | where {$_.Name -eq $Name}
             If ($res) {
-                $SetId = $res.VariableSetId
+                $SetId = $res[0].VariableSetId
             } else {
                 If ($Create.IsPresent){
                     # Create new variable set
@@ -204,9 +244,9 @@ function New-OctopusVariableSet {
             }
         }
         'ByProject' {
-            $res = (Get-OctopusResource 'projects/all' -Server $Server -ApiKey $ApiKey) | where {$_.Name -eq $Project}
+            $res = (Get-OctopusResource 'projects/all' -Server $Server -ApiKey $ApiKey)|Where {$_.Name -eq $Project}
             If ($res) {
-                $SetId = $proj.VariableSetId
+                $SetId = $res[0].VariableSetId
             }            
         }
 
@@ -214,14 +254,95 @@ function New-OctopusVariableSet {
             if ($uri.StartsWith('variables/')) {
                 $SetId = ($uri -split '/')[1]
             } else {
-                $set = Get-OctopusResource $uri -Server $Server -ApiKey $ApiKey
+                $res = Get-OctopusResource $uri -Server $Server -ApiKey $ApiKey
                 If ($res) {
                     $SetId = $res.VariableSetId
                 }
             }
         }
     }
-    
+    Write-Verbose $SetId
     If (-Not $SetId) { return $null }
     return [OctopusVariableSet]::New($SetId, $Server, $ApiKey)
+}
+
+function Rename-OctopusVariable {
+    [CmdletBinding(DefaultParameterSetName="Multiple")]
+    Param(
+        [Parameter(
+            mandatory=$true,
+            position=0,
+            ValueFromPipeline=$false,
+            ValueFromPipelineByPropertyName=$true,
+            ParameterSetName='Single')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+
+        [Alias("Value")]
+        [Parameter(
+            mandatory=$true,
+            position=1,
+            ValueFromPipeline=$false,
+            ValueFromPipelineByPropertyName=$true,
+            ParameterSetName='Single')]
+        [ValidateNotNullOrEmpty()]
+        [string]$NewName,
+
+        [Parameter(
+            mandatory=$true,
+            ValueFromPipeline=$true,
+            ValueFromPipelineByPropertyName=$true,
+            HelpMessage="Variable names hash",
+            ParameterSetName='Multiple')]
+        [ValidateNotNullOrEmpty()]
+        [hashtable[]]$NameMap,
+
+        [Parameter(mandatory=$false)]
+        [switch]$CreateMock,
+        [Parameter(mandatory=$false)]
+        [string]$Filter='*',
+
+        [Parameter(mandatory=$false)][ValidateNotNullOrEmpty()]
+        [string]$Server=$ENV:OCTOPUS_URI,
+        [Parameter(mandatory=$false)][ValidateNotNullOrEmpty()]
+        [string]$ApiKey=$ENV:OCTOPUS_API_KEY
+    )
+
+    begin {
+        $InputArray = @()
+    }
+
+    process {
+        switch ($PSCmdlet.ParameterSetName) {
+            'Single' {
+                $InputArray += @{"$Name"="$NewName"}
+            }
+            'Multiple' {
+                $InputArray += $NameMap
+             }
+        }
+    }
+
+    end {
+        foreach($uri in @('libraryvariablesets/all', 'projects/all')){
+            (Get-OctopusResource -uri $uri -Server $Server -ApiKey $ApiKey) | ForEach-Object {
+                If ($_.Name -Like $Filter) {
+                    $vs = New-OctopusVariableSet -uri "variables/$($_.VariableSetId)" -Server $Server -ApiKey $ApiKey
+                    Write-Verbose "Variable set ID: $($vs.Id)"
+                    foreach($h in $InputArray) {
+                        $h | Write-Verbose
+                        $h.GetEnumerator() | ForEach-Object {
+                            Write-Verbose "Renaming variable $($_.Name) to $($_.Value)"
+                            $vs.rename_variable($_.Name, $_.Value)
+                            $vs.replace_variable($_.Name, $_.Value)
+                            If ($CreateMock.IsPresent){
+                                Write-Verbose "Creating mock variable $($_.Name) with value '#{$($_.Value)}'"
+                                $vs.set($_.Name, "#{$($_.Value)}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
